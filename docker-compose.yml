@@ -1,0 +1,81 @@
+services:
+  # Airflow stores DAG runs, task state, and user accounts in this Postgres database.
+  postgres:
+    image: postgres:15
+    environment:
+      # These local credentials are only for the Airflow metadata database.
+      POSTGRES_USER: airflow
+      POSTGRES_PASSWORD: airflow
+      POSTGRES_DB: airflow
+    healthcheck:
+      # Airflow services wait until Postgres is ready before starting.
+      test: ["CMD", "pg_isready", "-U", "airflow"]
+      interval: 10s
+      retries: 5
+      start_period: 5s
+    restart: always
+
+  # This one-time service prepares the Airflow database and creates the admin user.
+  airflow-init:
+    image: apache/airflow:2.9.3-python3.11
+    depends_on:
+      postgres:
+        condition: service_healthy
+    env_file:
+      # Project secrets and runtime values are loaded from .env.
+      - .env
+    environment:
+      # LocalExecutor lets the scheduler run tasks locally in this Docker setup.
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      # Keep the Airflow UI clean by hiding example DAGs.
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      # Install this project package inside the Airflow container.
+      _PIP_ADDITIONAL_REQUIREMENTS: "-e /opt/airflow"
+    volumes:
+      # Mount the whole project so Airflow can see dags, source code, data, and build output.
+      - ./:/opt/airflow
+    # Run database migrations, then create a local admin user if it does not already exist.
+    command: >
+      bash -c "airflow db migrate &&
+               airflow users create --username airflow --password airflow
+               --firstname Air --lastname Flow --role Admin --email airflow@example.com || true"
+
+  # This service runs the Airflow web UI at http://localhost:8080.
+  airflow-webserver:
+    image: apache/airflow:2.9.3-python3.11
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _PIP_ADDITIONAL_REQUIREMENTS: "-e /opt/airflow"
+    volumes:
+      - ./:/opt/airflow
+    ports:
+      # Host port 8080 maps to the Airflow webserver port inside the container.
+      - "8080:8080"
+    command: airflow webserver
+    restart: always
+
+  # This service checks schedules and sends DAG tasks to the executor.
+  airflow-scheduler:
+    image: apache/airflow:2.9.3-python3.11
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+    env_file:
+      - .env
+    environment:
+      AIRFLOW__CORE__EXECUTOR: LocalExecutor
+      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+      _PIP_ADDITIONAL_REQUIREMENTS: "-e /opt/airflow"
+    volumes:
+      - ./:/opt/airflow
+    command: airflow scheduler
+    restart: always
