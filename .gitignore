@@ -1,9 +1,19 @@
+# Files that Git must never upload.
+
+# Python virtual environment (created by create_pipeline.sh)
 .venv/
+
+# Python and pytest cache folders
 __pycache__/
 .pytest_cache/
-.ruff_cache/
+
+# Private settings and the Snowflake login key
 .env
+.secrets/
+*.p8
+
+# Files the pipeline writes while it runs (raw, clean and curated data)
 build/
-*.egg-info/
-airflow.db
-logs/
+
+# Folder you may create to upload the sample file to S3 (see docs/SETUP_GUIDE.md)
+upload/

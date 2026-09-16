@@ -1,8 +1,23 @@
-boto3>=1.34
-pandas>=2.2
-pyarrow>=15.0
-pydantic>=2.6
-python-dotenv>=1.0
-snowflake-connector-python[pandas]>=3.7
-pytest>=8.0
-ruff>=0.5
+# Python libraries for your laptop (the Airflow Docker image already has its own copies).
+# Exact versions, so every student gets the same setup. Tested on 2026-09-16 with Python 3.11.
+
+# boto3: talks to AWS S3 (list and download files)
+boto3==1.43.95
+
+# pandas: works with data as tables (rows and columns)
+pandas==2.3.3
+
+# pyarrow: lets pandas write Parquet files
+pyarrow==25.0.1
+
+# pydantic: checks that every event has the right fields and values
+pydantic==2.13.5
+
+# python-dotenv: reads our settings from the .env file
+python-dotenv==1.2.3
+
+# snowflake-connector-python: logs in to Snowflake and runs SQL
+snowflake-connector-python==4.7.3
+
+# pytest: runs the unit tests in the tests folder
+pytest==9.1.1

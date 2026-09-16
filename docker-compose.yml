@@ -1,81 +1,112 @@
+# =====================================================================
+# docker-compose.yml
+# Job of this file: start Airflow on your laptop inside Docker.
+#
+# It starts 4 containers (small isolated boxes, each running one program):
+#   postgres           the database where Airflow keeps its runs and users
+#   airflow-init       runs once: prepares that database and creates the login user
+#   airflow-webserver  the Airflow web page at http://localhost:8090
+#   airflow-scheduler  the part that actually runs our DAG tasks
+#
+# Start:  docker compose up -d        Stop:  docker compose down
+# Needs Docker Compose 2.24 or newer (check with: docker compose version).
+# =====================================================================
+
+# Settings shared by all 3 Airflow containers.
+# "&airflow-common" gives this block a name, so we can reuse it below with "<<: *airflow-common".
+x-airflow-common: &airflow-common
+  # The official Airflow image. It already has pandas, pyarrow, pydantic, boto3 and the Snowflake connector.
+  image: apache/airflow:2.9.3-python3.11
+  # Run as user AIRFLOW_UID (your user id, set by the scripts) in group 0.
+  # ":-50000" means: use 50000 (Airflow's normal user) if AIRFLOW_UID is not set.
+  # Group 0 is the group the Airflow image gives write access to.
+  user: "${AIRFLOW_UID:-50000}:0"
+  # Load our private settings (AWS keys, bucket, Snowflake account) from the .env file.
+  # required: false means Docker does not complain if .env is missing (for example in remove_pipeline.sh).
+  env_file:
+    - path: .env
+      required: false
+  environment:
+    # LocalExecutor runs the tasks inside the scheduler container.
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    # Where Airflow's own database is: type postgresql, user airflow, password airflow,
+    # host postgres (the container below), database name airflow.
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
+    # Do not show Airflow's example DAGs, only ours.
+    AIRFLOW__CORE__LOAD_EXAMPLES: "false"
+    # Airflow reads DAG files from our dags folder.
+    AIRFLOW__CORE__DAGS_FOLDER: /opt/project/dags
+    # Python finds our code (the telemetry_etl package) in the src folder.
+    PYTHONPATH: /opt/project/src
+  volumes:
+    # Our project folder (./) appears inside the container at /opt/project.
+    - ./:/opt/project
+    # Task logs are kept in a shared Docker volume, so the web page can show them.
+    - airflow-logs:/opt/airflow/logs
+
 services:
-  # Airflow stores DAG runs, task state, and user accounts in this Postgres database.
+  # Airflow's own database.
   postgres:
     image: postgres:15
     environment:
-      # These local credentials are only for the Airflow metadata database.
+      # User, password and database name for Airflow. Only used inside Docker.
       POSTGRES_USER: airflow
       POSTGRES_PASSWORD: airflow
       POSTGRES_DB: airflow
+    volumes:
+      # Keep the database files in a Docker volume, so they survive a restart.
+      - airflow-db:/var/lib/postgresql/data
     healthcheck:
-      # Airflow services wait until Postgres is ready before starting.
+      # Other containers wait until this check says the database is ready.
       test: ["CMD", "pg_isready", "-U", "airflow"]
-      interval: 10s
-      retries: 5
-      start_period: 5s
-    restart: always
+      # Run the check every 5 seconds.
+      interval: 5s
+      # Give up after 10 failed checks.
+      retries: 10
 
-  # This one-time service prepares the Airflow database and creates the admin user.
+  # One-time setup of Airflow.
   airflow-init:
-    image: apache/airflow:2.9.3-python3.11
+    # Use all the shared settings from the top of the file.
+    <<: *airflow-common
+    # Start only after the postgres health check says "ready".
     depends_on:
       postgres:
         condition: service_healthy
-    env_file:
-      # Project secrets and runtime values are loaded from .env.
-      - .env
-    environment:
-      # LocalExecutor lets the scheduler run tasks locally in this Docker setup.
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      # Keep the Airflow UI clean by hiding example DAGs.
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      # Install this project package inside the Airflow container.
-      _PIP_ADDITIONAL_REQUIREMENTS: "-e /opt/airflow"
-    volumes:
-      # Mount the whole project so Airflow can see dags, source code, data, and build output.
-      - ./:/opt/airflow
-    # Run database migrations, then create a local admin user if it does not already exist.
+    # 1) create or update Airflow's tables  2) create the web login airflow / airflow.
+    # "|| true" means: if the user already exists, that is fine, carry on.
+    # The ">" joins the next lines into one command.
+    # Keep all lines of this command at the same indent, or YAML breaks it into separate commands.
     command: >
       bash -c "airflow db migrate &&
-               airflow users create --username airflow --password airflow
-               --firstname Air --lastname Flow --role Admin --email airflow@example.com || true"
+      (airflow users create --username airflow --password airflow
+      --firstname Air --lastname Flow --role Admin --email airflow@example.com || true)"
 
-  # This service runs the Airflow web UI at http://localhost:8080.
+  # The web page.
   airflow-webserver:
-    image: apache/airflow:2.9.3-python3.11
+    <<: *airflow-common
+    # Start only after airflow-init has finished without errors.
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-    env_file:
-      - .env
-    environment:
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      _PIP_ADDITIONAL_REQUIREMENTS: "-e /opt/airflow"
-    volumes:
-      - ./:/opt/airflow
     ports:
-      # Host port 8080 maps to the Airflow webserver port inside the container.
-      - "8080:8080"
-    command: airflow webserver
-    restart: always
+      # Laptop port 8090 -> container port 8080. Open http://localhost:8090
+      # If you change 8090, also change AIRFLOW_URL in create_pipeline.sh.
+      - "8090:8080"
+    # The program to run in this container.
+    command: webserver
+    # If it crashes, Docker starts it again (unless you stopped it yourself).
+    restart: unless-stopped
 
-  # This service checks schedules and sends DAG tasks to the executor.
+  # The part that runs the tasks.
   airflow-scheduler:
-    image: apache/airflow:2.9.3-python3.11
+    <<: *airflow-common
     depends_on:
       airflow-init:
         condition: service_completed_successfully
-    env_file:
-      - .env
-    environment:
-      AIRFLOW__CORE__EXECUTOR: LocalExecutor
-      AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://airflow:airflow@postgres/airflow
-      AIRFLOW__CORE__LOAD_EXAMPLES: "false"
-      _PIP_ADDITIONAL_REQUIREMENTS: "-e /opt/airflow"
-    volumes:
-      - ./:/opt/airflow
-    command: airflow scheduler
-    restart: always
+    command: scheduler
+    restart: unless-stopped
+
+# The two Docker volumes used above. "docker compose down --volumes" deletes them.
+volumes:
+  airflow-db:
+  airflow-logs:
