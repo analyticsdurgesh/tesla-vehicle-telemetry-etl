@@ -1,93 +1,114 @@
-from __future__ import annotations
+# =====================================================================
+# quality.py
+# Job of this file: read JSONL files and check the quality of the events.
+#
+# JSONL means "JSON Lines": every line of the file is one JSON object.
+# We check each event in two ways:
+#   1. Schema check: does the event match TelemetryEvent in schemas.py?
+#   2. Business checks: rules that need common sense, for example
+#      "an event cannot happen after we received it".
+# If any check fails, we collect a problem message.
+# All the events we check together in one pipeline run are called a "batch".
+# =====================================================================
 
+# json turns a line of text into a Python dictionary, and back.
 import json
-from collections import Counter
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Iterable
 
+# Path helps us work with file paths.
+from pathlib import Path
+
+# ValidationError is the error pydantic raises when an event breaks the schema.
 from pydantic import ValidationError
 
+# The description of one event (see schemas.py).
 from telemetry_etl.schemas import TelemetryEvent
 
 
-@dataclass(frozen=True)
-class QualityIssue:
-    # One failed rule is stored as one quality issue.
-    rule: str
-    event_id: str | None
-    message: str
-
-
-@dataclass(frozen=True)
-class QualityResult:
-    # Valid records move forward; issues explain what failed and why.
-    valid_records: list[dict]
-    issues: list[QualityIssue]
-
-    @property
-    def passed(self) -> bool:
-        # The batch passes only when no quality issues were found.
-        return not self.issues
-
-
-def read_jsonl(path: str | Path) -> list[dict]:
-    # Read newline-delimited JSON where each line is one vehicle event.
+# Read a JSONL file. "-> list[dict]" means the result is a list of dictionaries (one per event).
+def read_jsonl(file_path) -> list[dict]:
+    # This list will hold one dictionary per line of the file.
     records = []
-    with Path(path).open("r", encoding="utf-8") as file:
+    # Open the file for reading as text.
+    # "with" closes the file for us when the block ends, even after an error.
+    with open(file_path, encoding="utf-8") as file:
+        # Go through the file line by line. line_number starts at 1.
         for line_number, line in enumerate(file, start=1):
-            if line.strip():
-                try:
-                    records.append(json.loads(line))
-                except json.JSONDecodeError as exc:
-                    # Keep parse failures as records so validation can report them later.
-                    records.append({"_invalid_json": str(exc), "_line_number": line_number})
+            # Skip empty lines.
+            if line.strip() == "":
+                continue
+            # Try to turn the text into a dictionary.
+            try:
+                records.append(json.loads(line))
+            # If the line is not valid JSON, stop and say which line is broken.
+            except json.JSONDecodeError as error:
+                raise ValueError(f"{file_path} line {line_number} is not valid JSON: {error}")
+    # Give back all the events we read.
     return records
 
 
-def validate_records(records: Iterable[dict]) -> QualityResult:
-    # Collect clean records and failed rule details in the same pass.
-    valid_records: list[dict] = []
-    issues: list[QualityIssue] = []
-    event_ids: list[str] = []
+# Write a list of events to a JSONL file and give back the file path.
+def write_jsonl(records: list[dict], file_path: Path) -> Path:
+    # Make sure the folder for the file exists.
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    # Open the file for writing ("w"). This replaces any old file with the same name.
+    with open(file_path, "w", encoding="utf-8") as file:
+        # Write each event as one line of JSON.
+        for record in records:
+            file.write(json.dumps(record) + "\n")
+    # Give back the path so the next step knows where the file is.
+    return file_path
 
-    for raw in records:
-        if "_invalid_json" in raw:
-            # Invalid JSON cannot be checked against the schema.
-            issues.append(QualityIssue("json_parse", None, raw["_invalid_json"]))
-            continue
 
-        event_id = raw.get("event_id")
+# Check a batch of events.
+# The result is a pair (a "tuple") of two lists: the clean events, and the problem messages.
+def check_records(records: list[dict]) -> tuple[list[dict], list[str]]:
+    # Events that passed the schema check go into this list.
+    clean_records = []
+    # Every problem we find is written into this list as a sentence.
+    problems = []
+    # Event ids we have already seen, so we can find duplicates.
+    seen_event_ids = set()
+
+    # Check the events one by one.
+    for record in records:
+        # Take the event id for our messages. Use "unknown" if it is missing.
+        event_id = record.get("event_id", "unknown")
+
+        # Check 1: the schema. Pydantic compares the event with TelemetryEvent.
         try:
-            # Pydantic checks required fields, data types, allowed values, and ranges.
-            event = TelemetryEvent.model_validate(raw)
-        except ValidationError as exc:
-            issues.append(QualityIssue("schema", event_id, exc.errors()[0]["msg"]))
+            event = TelemetryEvent.model_validate(record)
+        except ValidationError as error:
+            # Take the first mistake pydantic found.
+            first_error = error.errors()[0]
+            # "loc" tells us which field is wrong, for example battery_soc.
+            field_name = ".".join(str(part) for part in first_error["loc"])
+            # Save a readable problem message.
+            problems.append(f"{event_id}: field '{field_name}' is wrong: {first_error['msg']}")
+            # Skip the other checks for this broken event and go to the next event.
             continue
 
-        # Convert timestamps and other values into JSON-friendly Python types.
-        record = event.model_dump(mode="json")
-        valid_records.append(record)
-        event_ids.append(record["event_id"])
+        # Check 2: the same event id must not appear twice in one batch.
+        if event.event_id in seen_event_ids:
+            problems.append(f"{event.event_id}: duplicate event_id in this batch")
+        # Remember this id for the next events.
+        seen_event_ids.add(event.event_id)
 
-        # Business rule: an event cannot happen after it was ingested.
-        if record["event_ts"] > record["ingest_ts"]:
-            issues.append(QualityIssue("timestamp_order", event_id, "event_ts is after ingest_ts"))
-        # Business rule: a moving vehicle should have a real odometer reading.
-        if record["odometer_miles"] == 0 and record["speed_mph"] > 0:
-            issues.append(QualityIssue("odometer_speed", event_id, "moving vehicle has zero odometer"))
-        # Business rule: alert events must explain which alert happened.
-        if record["event_type"] == "alert" and not record["alert_code"]:
-            issues.append(QualityIssue("alert_code", event_id, "alert event requires alert_code"))
+        # Check 3: an event cannot happen after we received it.
+        if event.event_ts > event.ingest_ts:
+            problems.append(f"{event.event_id}: event_ts is later than ingest_ts")
 
-    # Duplicate event IDs would cause incorrect warehouse merges, so flag them.
-    duplicate_ids = [event_id for event_id, count in Counter(event_ids).items() if count > 1]
-    for event_id in duplicate_ids:
-        issues.append(QualityIssue("duplicate_event", event_id, "duplicate event_id in batch"))
+        # Check 4: a car with a speed above 0 must have a real odometer reading (not 0).
+        if event.speed_mph > 0 and event.odometer_miles == 0:
+            problems.append(f"{event.event_id}: speed is above 0 but odometer is 0")
 
-    return QualityResult(valid_records=valid_records, issues=issues)
+        # Check 5: an alert event must say which alert it is.
+        if event.event_type == "alert" and not event.alert_code:
+            problems.append(f"{event.event_id}: alert event has no alert_code")
 
+        # Keep the checked event as a plain dictionary.
+        # mode="json" turns dates into text like "2026-06-06T08:00:00Z" so we can save it.
+        clean_records.append(event.model_dump(mode="json"))
 
-def validate_jsonl_file(path: str | Path) -> QualityResult:
-    # Convenience helper for the common flow: read a file, then validate it.
-    return validate_records(read_jsonl(path))
+    # Give back the clean events and the list of problems.
+    # If problems is empty, the batch is good.
+    return clean_records, problems

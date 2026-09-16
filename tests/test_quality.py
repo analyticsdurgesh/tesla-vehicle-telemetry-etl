@@ -1,9 +1,20 @@
-from telemetry_etl.quality import validate_records
+# =====================================================================
+# test_quality.py
+# Job of this file: prove that the quality checks in quality.py work.
+# Run all tests with:  .venv/bin/python -m pytest
+# Each function whose name starts with "test_" is one test. pytest finds and runs them.
+# "assert" means "this must be true, otherwise the test fails".
+# =====================================================================
+
+# The function we want to test.
+from telemetry_etl.quality import check_records
 
 
-def valid_record(**overrides):
-    # Start from one clean event so tests can change only the field they care about.
-    record = {
+# A helper (not a test, because its name does not start with "test_").
+# "**changes" collects any named values we pass in, for example battery_soc=120.
+def good_event(**changes) -> dict:
+    # One correct event. Every test starts from this.
+    event = {
         "event_id": "evt_test_001",
         "vin": "5YJ3E1EA7KF000001",
         "event_ts": "2026-06-06T08:00:00Z",
@@ -21,38 +32,39 @@ def valid_record(**overrides):
         "alert_code": None,
         "software_version": "2026.14.3",
     }
-    # Overrides make it easy to create invalid records for negative tests.
-    record.update(overrides)
-    return record
+    # Apply the changes a test asks for, for example battery_soc=120.
+    event.update(changes)
+    return event
 
 
-def test_validate_records_accepts_valid_payload():
-    # A complete and realistic record should pass all checks.
-    result = validate_records([valid_record()])
-
-    assert result.passed
-    assert len(result.valid_records) == 1
-
-
-def test_validate_records_rejects_invalid_battery_soc():
-    # Battery state of charge cannot be above 100 percent.
-    result = validate_records([valid_record(battery_soc=120)])
-
-    assert not result.passed
-    assert result.issues[0].rule == "schema"
+def test_good_event_passes():
+    # A correct event gives no problems and one clean record.
+    clean_records, problems = check_records([good_event()])
+    assert problems == []
+    assert len(clean_records) == 1
 
 
-def test_validate_records_flags_duplicate_event_ids():
-    # Duplicate event IDs can break merge logic, so the batch should fail.
-    result = validate_records([valid_record(), valid_record()])
+def test_battery_above_100_is_rejected():
+    # Battery percent cannot be 120, so the schema check must complain about battery_soc.
+    clean_records, problems = check_records([good_event(battery_soc=120)])
+    assert len(problems) == 1
+    assert "battery_soc" in problems[0]
 
-    assert not result.passed
-    assert any(issue.rule == "duplicate_event" for issue in result.issues)
+
+def test_duplicate_event_id_is_rejected():
+    # The same event twice in one batch is a problem.
+    clean_records, problems = check_records([good_event(), good_event()])
+    # any(...) is True if at least one problem message contains the word "duplicate".
+    assert any("duplicate" in problem for problem in problems)
 
 
-def test_alert_requires_alert_code():
-    # Alert events must include an alert code so operators know what happened.
-    result = validate_records([valid_record(event_type="alert", alert_code=None)])
+def test_alert_without_code_is_rejected():
+    # An alert event must have an alert_code.
+    clean_records, problems = check_records([good_event(event_type="alert", alert_code=None)])
+    assert any("alert_code" in problem for problem in problems)
 
-    assert not result.passed
-    assert any(issue.rule == "alert_code" for issue in result.issues)
+
+def test_time_without_time_zone_is_rejected():
+    # "2026-06-06T08:00:00" has no time zone (no Z at the end), so it is not accepted.
+    clean_records, problems = check_records([good_event(event_ts="2026-06-06T08:00:00")])
+    assert any("event_ts" in problem for problem in problems)

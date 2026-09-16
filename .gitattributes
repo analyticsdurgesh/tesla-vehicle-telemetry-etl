@@ -1,0 +1,3 @@
+# Keep Unix line endings (LF) in every file, also when the repo is cloned on Windows.
+# Bash scripts and the .env file break with Windows line endings (CRLF).
+* text=auto eol=lf

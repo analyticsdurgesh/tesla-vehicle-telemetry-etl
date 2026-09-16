@@ -1,4 +1,3 @@
-"""Tesla-style telemetry ETL package."""
-
-# Export module names so readers can quickly see the package building blocks.
-__all__ = ["config", "extract", "load", "quality", "schemas", "transform"]
+# This file tells Python that the "telemetry_etl" folder is a package.
+# A package is a folder of Python files that other code can import,
+# for example: from telemetry_etl import extract

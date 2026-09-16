@@ -1,139 +1,141 @@
-from __future__ import annotations
+# =====================================================================
+# transform.py
+# Job of this file: the "T" in ETL (Transform).
+# It turns the clean events into 5 tables that are useful for reports,
+# and saves each table as a Parquet file.
+#
+# The 5 tables:
+#   1. telemetry_enriched      every event, plus a few helpful extra columns
+#   2. vehicle_hourly_metrics  one row per car per hour (speed, battery, ...)
+#   3. trip_metrics            one row per car per day, only while moving
+#   4. battery_health          one row per car per day about the battery
+#   5. alerts                  only the alert events
+#
+# Parquet is a file format made for tables. It keeps the column types
+# (numbers stay numbers, dates stay dates) and Snowflake can load it directly.
+# =====================================================================
 
-import argparse
+# Path helps us work with file and folder paths.
 from pathlib import Path
 
+# pandas lets us work with data as a table (a "DataFrame"). "pd" is its usual short name.
 import pandas as pd
 
-from telemetry_etl.quality import validate_jsonl_file
+
+# Put the battery percentage into a simple group that is easy to read in a report.
+def battery_band(battery_soc: float) -> str:
+    # 0 to 20 percent
+    if battery_soc <= 20:
+        return "critical"
+    # above 20, up to 50 percent
+    if battery_soc <= 50:
+        return "low"
+    # above 50, up to 80 percent
+    if battery_soc <= 80:
+        return "normal"
+    # above 80 percent
+    return "high"
 
 
-def build_curated_frames(records: list[dict]) -> dict[str, pd.DataFrame]:
-    # Convert validated event dictionaries into a DataFrame for transformation.
-    df = pd.DataFrame.from_records(records)
-    if df.empty:
-        # Return every expected output name even when the input batch is empty.
-        return {
-            "telemetry_enriched": df,
-            "vehicle_hourly_metrics": df,
-            "trip_metrics": df,
-            "battery_health": df,
-            "alerts": df,
-        }
+# Build the 5 tables. The result is a dictionary: table name -> DataFrame.
+def build_tables(records: list[dict]) -> dict[str, pd.DataFrame]:
+    # Turn the list of events into a table. Each event becomes one row.
+    events = pd.DataFrame(records)
 
-    # Convert timestamp strings to timezone-aware pandas timestamps.
-    df["event_ts"] = pd.to_datetime(df["event_ts"], utc=True)
-    df["ingest_ts"] = pd.to_datetime(df["ingest_ts"], utc=True)
-    # Add time fields used for daily and hourly warehouse models.
-    df["event_date"] = df["event_ts"].dt.date.astype(str)
-    df["event_hour"] = df["event_ts"].dt.floor("h")
-    # Add simple flags that make reporting queries easier.
-    df["is_moving"] = df["speed_mph"] > 1
-    df["is_charging"] = df["charging_state"].str.lower().eq("charging")
-    # Bucket battery percentage into human-friendly monitoring bands.
-    df["battery_band"] = pd.cut(
-        df["battery_soc"],
-        bins=[-1, 20, 50, 80, 101],
-        labels=["critical", "low", "normal", "high"],
-    ).astype(str)
+    # --- Step 1: fix the types and add helpful columns -------------------
 
-    # Build hourly vehicle metrics for dashboards and monitoring.
-    hourly = (
-        df.groupby(["vin", "event_hour"], as_index=False)
-        .agg(
-            events=("event_id", "count"),
-            avg_speed_mph=("speed_mph", "mean"),
-            max_speed_mph=("speed_mph", "max"),
-            avg_battery_soc=("battery_soc", "mean"),
-            min_battery_soc=("battery_soc", "min"),
-            max_battery_temp_c=("battery_temp_c", "max"),
-            moving_events=("is_moving", "sum"),
-            charging_events=("is_charging", "sum"),
-            latest_odometer_miles=("odometer_miles", "max"),
-        )
-        .sort_values(["vin", "event_hour"])
+    # The times are text right now. Turn them into real date-time values in UTC.
+    # format="ISO8601" accepts times with and without parts of a second, for example 08:00:00Z and 08:00:00.5Z.
+    events["event_ts"] = pd.to_datetime(events["event_ts"], utc=True, format="ISO8601")
+    events["ingest_ts"] = pd.to_datetime(events["ingest_ts"], utc=True, format="ISO8601")
+    # The day of the event, for example 2026-06-06.
+    events["event_date"] = events["event_ts"].dt.date
+    # The hour of the event, for example 08:25 becomes 08:00.
+    events["event_hour"] = events["event_ts"].dt.floor("h")
+    # True when the car is moving (faster than 1 mile per hour).
+    events["is_moving"] = events["speed_mph"] > 1
+    # True when the charging state is "Charging" (we ignore upper and lower case).
+    events["is_charging"] = events["charging_state"].str.lower() == "charging"
+    # Battery group (critical, low, normal, high). apply runs battery_band on every row.
+    events["battery_band"] = events["battery_soc"].apply(battery_band)
+    # Sort the rows by car and by time, so the table is easy to read.
+    events = events.sort_values(["vin", "event_ts"])
+
+    # --- Step 2: table 2, one row per car per hour -----------------------
+
+    # groupby puts rows with the same car and the same hour together.
+    # as_index=False keeps vin and event_hour as normal columns in the result.
+    # agg then calculates one value per group. The format is:
+    #   new_column=("existing_column", "calculation")
+    # Note: "sum" of a True/False column counts the True values (True = 1, False = 0).
+    hourly = events.groupby(["vin", "event_hour"], as_index=False).agg(
+        events=("event_id", "count"),
+        avg_speed_mph=("speed_mph", "mean"),
+        max_speed_mph=("speed_mph", "max"),
+        avg_battery_soc=("battery_soc", "mean"),
+        min_battery_soc=("battery_soc", "min"),
+        max_battery_temp_c=("battery_temp_c", "max"),
+        moving_events=("is_moving", "sum"),
+        charging_events=("is_charging", "sum"),
+        latest_odometer_miles=("odometer_miles", "max"),
     )
 
-    # Build daily trip metrics from only events where the vehicle was moving.
-    trip_metrics = (
-        df[df["is_moving"]]
-        .groupby(["vin", "event_date"], as_index=False)
-        .agg(
-            first_event_ts=("event_ts", "min"),
-            last_event_ts=("event_ts", "max"),
-            start_odometer_miles=("odometer_miles", "min"),
-            end_odometer_miles=("odometer_miles", "max"),
-            avg_speed_mph=("speed_mph", "mean"),
-            max_speed_mph=("speed_mph", "max"),
-            autopilot_events=("autopilot_engaged", "sum"),
-        )
-    )
-    if not trip_metrics.empty:
-        # Distance is estimated from the odometer difference in the daily moving window.
-        trip_metrics["distance_miles"] = (
-            trip_metrics["end_odometer_miles"] - trip_metrics["start_odometer_miles"]
-        )
+    # --- Step 3: table 3, one row per car per day, only moving events ----
 
-    # Build daily battery health metrics per vehicle.
-    battery_health = (
-        df.groupby(["vin", "event_date"], as_index=False)
-        .agg(
-            avg_battery_soc=("battery_soc", "mean"),
-            min_battery_soc=("battery_soc", "min"),
-            avg_battery_temp_c=("battery_temp_c", "mean"),
-            max_battery_temp_c=("battery_temp_c", "max"),
-            charge_events=("is_charging", "sum"),
-        )
-        .sort_values(["vin", "event_date"])
+    # Keep only the rows where the car was moving.
+    moving = events[events["is_moving"]]
+    # Group by car and day, and calculate the trip numbers.
+    trips = moving.groupby(["vin", "event_date"], as_index=False).agg(
+        first_event_ts=("event_ts", "min"),
+        last_event_ts=("event_ts", "max"),
+        start_odometer_miles=("odometer_miles", "min"),
+        end_odometer_miles=("odometer_miles", "max"),
+        avg_speed_mph=("speed_mph", "mean"),
+        max_speed_mph=("speed_mph", "max"),
+        autopilot_events=("autopilot_engaged", "sum"),
+    )
+    # Distance driven = odometer at the end minus odometer at the start.
+    trips["distance_miles"] = trips["end_odometer_miles"] - trips["start_odometer_miles"]
+
+    # --- Step 4: table 4, one row per car per day about the battery ------
+
+    # Group by car and day, and calculate the battery numbers.
+    battery = events.groupby(["vin", "event_date"], as_index=False).agg(
+        avg_battery_soc=("battery_soc", "mean"),
+        min_battery_soc=("battery_soc", "min"),
+        avg_battery_temp_c=("battery_temp_c", "mean"),
+        max_battery_temp_c=("battery_temp_c", "max"),
+        charge_events=("is_charging", "sum"),
     )
 
-    # Keep alert rows separately so operations teams can monitor them directly.
-    alerts = df[df["event_type"].eq("alert")].copy()
+    # --- Step 5: table 5, only the alert events --------------------------
 
-    # Return all curated datasets by the same names used in Snowflake.
+    # Keep only the rows where event_type is "alert".
+    alerts = events[events["event_type"] == "alert"]
+
+    # Give back all 5 tables. The names match the Snowflake table names.
     return {
-        "telemetry_enriched": df.sort_values(["vin", "event_ts"]),
+        "telemetry_enriched": events,
         "vehicle_hourly_metrics": hourly,
-        "trip_metrics": trip_metrics,
-        "battery_health": battery_health,
+        "trip_metrics": trips,
+        "battery_health": battery,
         "alerts": alerts,
     }
 
 
-def write_curated_parquet(input_path: str | Path, output_dir: str | Path) -> dict[str, Path]:
-    # Quality checks must pass before any curated files are written.
-    result = validate_jsonl_file(input_path)
-    if result.issues:
-        issue_text = "; ".join(f"{issue.rule}:{issue.event_id}" for issue in result.issues)
-        raise ValueError(f"Data quality failed: {issue_text}")
-
-    # Create the output folder if it does not already exist.
-    output = Path(output_dir)
-    output.mkdir(parents=True, exist_ok=True)
-    # Transform valid raw records into curated DataFrames.
-    frames = build_curated_frames(result.valid_records)
-    written = {}
-    for name, frame in frames.items():
-        # Each curated DataFrame is written as one Parquet file.
-        path = output / f"{name}.parquet"
-        frame.to_parquet(path, index=False)
-        written[name] = path
-    return written
-
-
-def main() -> None:
-    # This command-line entry point runs the local sample ETL.
-    parser = argparse.ArgumentParser(description="Run local telemetry transformations.")
-    parser.add_argument("input_jsonl")
-    parser.add_argument("output_dir")
-    args = parser.parse_args()
-
-    written = write_curated_parquet(args.input_jsonl, args.output_dir)
-    for name, path in written.items():
-        # Print output paths so the user can inspect generated files.
-        print(f"{name}: {path}")
-
-
-if __name__ == "__main__":
-    # Run the CLI only when this file is executed as a module or script.
-    main()
+# Save each table as a Parquet file. The result is a dictionary: table name -> file path.
+def save_tables_as_parquet(tables: dict[str, pd.DataFrame], folder: Path) -> dict[str, Path]:
+    # Make sure the output folder exists.
+    folder.mkdir(parents=True, exist_ok=True)
+    # This dictionary will hold: table name -> Parquet file path.
+    saved_files = {}
+    # Save the tables one by one.
+    for name, table in tables.items():
+        # File name is the table name, for example trip_metrics.parquet
+        file_path = folder / f"{name}.parquet"
+        # Write the table. index=False means "do not save the pandas row numbers".
+        table.to_parquet(file_path, index=False)
+        # Remember where we saved it.
+        saved_files[name] = file_path
+    # Give back the list of saved files.
+    return saved_files
